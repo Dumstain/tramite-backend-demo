@@ -10,95 +10,85 @@ class ReviewerController extends Controller
 {
     /**
      * BANDEJA DE ENTRADA
-     * Devuelve todos los trámites que están esperando acción de un humano.
+     * Busca trámites pausados (REVIEW_PENDING)
      */
     public function inbox()
     {
-        // Traemos las instancias activas y su blueprint
+        // CORRECCIÓN: Buscamos explícitamente el estado que pone el Engine
         $instances = ProcedureInstance::with('blueprint')
-            ->where('status', 'IN_PROGRESS')
+            ->where('status', 'REVIEW_PENDING')
             ->latest()
             ->get();
 
-        // Filtramos en memoria: Solo queremos las que están en un nodo tipo 'review'
-        $pendingReviews = $instances->filter(function ($instance) {
-            $blueprint = $instance->blueprint;
-            // Buscamos el nodo actual en el JSON
-            $node = collect($blueprint->schema['nodes'])
-                ->firstWhere('id', $instance->current_step_id);
-
-            return ($node['type'] ?? '') === 'review';
-        })->values(); // Re-indexar array
-
-        return response()->json($pendingReviews);
+        return response()->json($instances);
     }
 
     /**
-     * VER DETALLE DEL TRÁMITE
+     * DETALLE DEL TRÁMITE
      */
     public function show($instanceId)
     {
-        $instance = ProcedureInstance::findOrFail($instanceId);
+        $instance = ProcedureInstance::with('blueprint')->findOrFail($instanceId);
+
+        // Recuperamos la configuración del paso actual para saber qué instrucciones dar
+        // (Aunque el state_store ya tiene los datos, a veces necesitamos la config del nodo)
+        $currentNode = collect($instance->blueprint->schema['nodes'])
+            ->firstWhere('id', $instance->current_step_id);
 
         return response()->json([
-            'id' => $instance->id,
-            'tramite' => $instance->blueprint->name,
-            'fecha_inicio' => $instance->created_at,
-            'datos' => $instance->state_store, // Aquí el revisor ve lo que llenó el usuario
-            'nodo_actual' => $instance->current_step_id
+            'instance' => $instance,
+            'node_config' => $currentNode
         ]);
     }
 
     /**
-     * TOMAR DECISIÓN (APROBAR / RECHAZAR)
+     * TOMA DE DECISIÓN
      */
     public function decide(Request $request, $instanceId)
     {
-        // 1. Validar input del revisor
         $request->validate([
-            'verdict' => 'required|in:approve,reject', // Solo aceptamos estas dos palabras
+            'verdict' => 'required|in:approve,reject',
             'comments' => 'nullable|string'
         ]);
 
         $instance = ProcedureInstance::findOrFail($instanceId);
         $blueprint = $instance->blueprint;
 
-        // 2. Obtener config del paso actual
-        $currentNode = collect($blueprint->schema['nodes'])
+        // 1. Buscar el nodo de revisión en el JSON
+        $node = collect($blueprint->schema['nodes'])
             ->firstWhere('id', $instance->current_step_id);
 
-        if (($currentNode['type'] ?? '') !== 'review') {
-            return response()->json(['error' => 'Este trámite no está en revisión'], 400);
-        }
+        // 2. Obtener a dónde ir (Next Step ID)
+        // El JSON guarda: props -> actions -> approve -> next_step_id
+        $actionMap = $node['props']['actions'] ?? [];
+        $nextStepId = $actionMap[$request->verdict]['next_step_id'] ?? null;
 
-        // 3. Buscar a dónde ir según la decisión
-        // En el JSON esperamos: props -> actions -> approve -> next_step_id
-        $actionConfig = $currentNode['props']['actions'][$request->verdict] ?? null;
-
-        if (!$actionConfig) {
-            return response()->json(['error' => 'Acción no configurada en el Blueprint'], 500);
-        }
-
-        $nextStepId = $actionConfig['next_step_id'];
-
-        // 4. Guardar Historial de Revisión en el State Store
+        // 3. Guardar log de la revisión
         $store = $instance->state_store;
-        $store['revisiones'][] = [
-            'fecha' => now()->toIso8601String(),
-            'veredicto' => $request->verdict,
-            'comentario' => $request->comments,
-            'paso_revisado' => $currentNode['id']
+        $store['revision_history'][] = [
+            'date' => now()->toIso8601String(),
+            'verdict' => $request->verdict,
+            'comments' => $request->comments,
+            'reviewer' => 'DemoUser'
         ];
         $instance->state_store = $store;
 
-        // 5. Avanzar
-        $instance->current_step_id = $nextStepId;
-        $instance->save();
+        // 4. Mover el trámite
+        if ($nextStepId) {
+            $instance->current_step_id = $nextStepId;
 
-        return response()->json([
-            'status' => 'success',
-            'message' => 'Revisión procesada correctamente',
-            'next_step' => $nextStepId
-        ]);
+            // Reactivamos el flujo (quitamos el estado pendiente)
+            $instance->status = 'IN_PROGRESS';
+            $instance->save();
+
+            // Opcional: Verificar si el siguiente paso es Fin o Automático inmediatamente
+            // (Para esta demo, dejemos que el usuario refresque su pantalla y el Engine procese)
+        } else {
+            // Si no hay paso siguiente configurado, terminamos o rechazamos globalmente
+            $instance->status = $request->verdict === 'approve' ? 'COMPLETED' : 'REJECTED';
+            $instance->save();
+        }
+
+        return response()->json(['message' => 'Revisión procesada']);
     }
 }
